@@ -317,7 +317,7 @@ canvas { display: block; }
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label><span style="text-transform:none">k<sub>B</sub>T</span></label>
+          <label>Temperature <span style="text-transform:none">k<sub>B</sub>T</span></label>
           <input type="number" id="kBT" value="1" step="0.1" min="0.01" onchange="computeAll()">
         </div>
         <div class="form-group">
@@ -379,7 +379,7 @@ canvas { display: block; }
         <div class="form-row">
           <div class="form-group"><label>Max iterations</label>
             <input type="number" id="optSteps" value="1000" min="50" max="200000" step="50"></div>
-          <div class="form-group"><label>Convergence tolerance <span style="text-transform:none">&Delta; (0 = off: stop once F &ge; 1 &minus; &Delta;)</span></label>
+          <div class="form-group"><label>Convergence tolerance <span style="text-transform:none">&Delta; (0 = off: stop once 𝓕 &ge; 1 &minus; &Delta;)</span></label>
             <input type="number" id="optTol" value="0" step="0.00001" min="0"></div>
         </div>
         <div class="form-row">
@@ -1084,9 +1084,12 @@ function buildMap(n, g, profile, sigma) {
     }
     if (sum > 0) for (let i = lo; i <= hi; i++) W[I][i] /= sum;
   }
-  if (!overlap) return {W, N, overlap: false, balErr: 0};  // already balanced
+  // `ov` is reported because it is the width that makes this level's windows meet;
+  // makeOptimizer has to answer to the same number (see the mask there).
+  if (!overlap) return {W, N, overlap: false, ov: 0, balErr: 0};  // already balanced
   const bal = sinkhornMap(W);
-  return {W: bal.W, N, overlap: true, balErr: Math.max(bal.rowErr, bal.colErr)};
+  return {W: bal.W, N, overlap: true, ov,
+          balErr: Math.max(bal.rowErr, bal.colErr)};
 }
 
 function weightHard(n, g) { return buildMap(n, g, 'flat'); }
@@ -1527,9 +1530,25 @@ function makeOptimizer(nPrev, g, sigma, calC) {
   const nMicro = state.n;
   // Support mask: the same block-centred windows buildMap uses, with the window
   // width w the user sets in place of the derived round(g/2).  w counts extra
-  // atoms added on each side of the g-block, so w = 0 is the disjoint partition.
+  // atoms added on each side of the g-block, so w = 0 is the disjoint partition —
+  // where there IS one.  A disjoint partition of equal blocks exists only when
+  // N divides n, i.e. when the block size b = n/N is a whole number; with b
+  // fractional the windows centred on the blocks land on halves and the atom
+  // between two of them falls in NEITHER (n = 5, N = 2, w = 0: the window of row
+  // 0 is atoms 0-1 and of row 1 is atoms 3-4, so atom 2 is in no row at all).
+  // That atom then contributes to nothing at this level — and the map is not even
+  // admissible, because an empty column can never be equalised: the search runs
+  // with balErr = 1, its gate (which sits just above the attainable floor) never
+  // opens, and the level is handed back unoptimised.  buildMap closes exactly this
+  // gap by widening to the derived overlap ov, which is why its Gaussian and hard
+  // maps are admissible at a fractional b; the search answers to the same rule, so
+  // a count that does not tile overrides w upward to ov.  (The same n = 5, N = 2 at
+  // w = 1 covers atom 2 by accident, which is how the hole hid: any w >= 1 hides it
+  // again, and at an integer b there is no hole to hide.)
+  const tiles = Math.abs(b - Math.round(b)) < 1e-9;
+  const wMask = tiles ? state.optWin : Math.max(state.optWin, base.ov);
   const mOf = (I) => I * b + (b - 1) / 2;
-  const half = (b - 1) / 2 + state.optWin;
+  const half = (b - 1) / 2 + wMask;
   const mask = M.zeros(N, n);
   for (let I = 0; I < N; I++) {
     const mI = mOf(I);
@@ -1622,6 +1641,10 @@ function makeOptimizer(nPrev, g, sigma, calC) {
   const steps = state.optSteps;
   return {
     N, n, mask, raw, startBal, bestW, best: p0.F, bestParts: p0, lastParts: p0,
+    // The residual of the map `bestW` actually is, carried with the map: a preview
+    // drawn mid-run reports this level's admissibility, and 0 is a claim, not a
+    // placeholder (a no-level preview would have read "balanced" whatever the map).
+    bestBalErr: startErr,
     lr: OPT_LR, eps: OPT_EPS, tol: state.optTol, steps, gate, startErr,
     converged: false, evalRaw, score, splitW, overlap: base.overlap,
     s: 0,            // steps consumed so far
@@ -1658,6 +1681,7 @@ function* optimizerRun(o) {
     o.lastParts = step.parts;   // reported while the search runs, accepted or not
     if (step.balErr <= o.gate && step.parts.F > o.best) {
       o.best = step.parts.F; o.bestW = step.W; o.bestParts = step.parts;
+      o.bestBalErr = step.balErr;
     }
     if (o.tol > 0 && 1 - o.best <= o.tol) { o.converged = true; break; }
     yield o;
@@ -2429,7 +2453,11 @@ function drawMolecule() {
           : [])
       : [[{t: `n = ${n} beads`}], [{t: 'no coarse-graining'}]]);
   ctx.fillStyle = COL.dim; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
-  mt(ctx, `H = ${state.H},  ζ = ${state.zeta},  k_{B}T/V = ${state.gStress.toFixed(3)}`,
+  // The three parameters read the way they went in: H and ζ are printed as entered, and
+  // k_BT/V is a ratio that can be 1/3, so it is rounded to three decimals and then read
+  // back as a number — `1`, not `1.000`, on the row that says `H = 1`.
+  const gv = +state.gStress.toFixed(3);
+  mt(ctx, `H = ${state.H},  ζ = ${state.zeta},  k_{B}T/V = ${gv}`,
                m.left, H - 8);
 }
 
@@ -3827,7 +3855,11 @@ function drawModulus(ctx, W, H, m, slow) {
   const sc = makeYScale(pts.flatMap(p => [p.g0, p.sum]), m, ph, state.yScale === 'log');
   if (!sc) return;
   drawYAxis(ctx, sc, m, pw, ph, v => v.toFixed(2));
-  drawAxes(ctx, m, pw, ph, timeAxisLabel(), 'modulus');
+  // The ordinate says which quantity is on it, and on the single-mode tab it also says
+  // which mode: one curve of the mode p = 1 sits where the whole spectrum's curve sits,
+  // and the axis is the one place on the picture that names the abscissa's quantity
+  // rather than a curve's ink.
+  drawAxes(ctx, m, pw, ph, timeAxisLabel(), slow ? 'modulus, p = 1' : 'modulus');
   // The abscissa is bare without them: how fast the modulus has fallen by is a number,
   // and "time tH/ζ" names a unit rather than a place on the picture.
   drawXNumbers(ctx, m, pw, ph, tMax, timeUnit());
@@ -4476,12 +4508,12 @@ function displayResults() {
   /* --- the spectral decomposition itself:  L = U Λ Uᵀ  on u₀^⊥ --- */
   const Lam = M.zeros(d0, d0);
   for (let p = 0; p < d0; p++) Lam[p][p] = lam[p];
-  h += sec(`Eigenvalue matrix Λ = diag(λ<sub>1</sub>, …, λ<sub>n−1</sub>) ((n−1)×(n−1)) <span class="tag">L = U Λ U<sup>T</sup> on u<sub>0</sub><sup>⊥</sup></span>`,
+  h += sec(`Eigenvalue matrix Λ = diag(λ<sub>1</sub>, …, λ<sub>${d0}</sub>) (${d0}×${d0}) <span class="tag">L = U Λ U<sup>T</sup> on u<sub>0</sub><sup>⊥</sup></span>`,
     `<div class="result-data">${matrixToStr(Lam, 6)}</div>`);
   // state.Uint holds the modes as rows; U presents them the way the paper does, one mode per column.
   const Umat = M.zeros(n, d0);
   for (let p = 0; p < d0; p++) for (let i = 0; i < n; i++) Umat[i][p] = state.Uint[p][i];
-  h += sec(`Eigenvector matrix U (n×(n−1)) <span class="tag">column p = mode u<sub>p</sub>, U<sup>T</sup>U = I</span>`,
+  h += sec(`Eigenvector matrix U (${n}×${d0}) <span class="tag">column p = mode u<sub>p</sub>, U<sup>T</sup>U = I</span>`,
     `<div class="result-data">${matrixToStr(Umat, 5)}</div>`);
 
   /* --- the one CG level this panel is showing, chosen in the panel header --- */
@@ -4516,7 +4548,7 @@ function displayResults() {
       `<div class="result-data">${matrixToStr(lv.Hk)}</div>`);
     h += sec(`Level ${lvl}: H<sup>⊥</sup> = L − H<sup>C</sup> (${n}×${n})`,
       `<div class="result-data">${matrixToStr(M.sub(L, lv.Hk))}</div>`);
-    h += sec(`Level ${lvl}: J<sup>C</sup> = Λ<sup>−1/2</sup> U<sup>T</sup> H<sup>C</sup> U Λ<sup>−1/2</sup> ((n−1)×(n−1)) <span class="tag">(J<sup>C</sup>)<sup>2</sup> = J<sup>C</sup>, tr J<sup>C</sup> = N<sup>(${lvl})</sup> − 1</span>`,
+    h += sec(`Level ${lvl}: J<sup>C</sup> = Λ<sup>−1/2</sup> U<sup>T</sup> H<sup>C</sup> U Λ<sup>−1/2</sup> (${d0}×${d0}) <span class="tag">(J<sup>C</sup>)<sup>2</sup> = J<sup>C</sup>, tr J<sup>C</sup> = N<sup>(${lvl})</sup> − 1</span>`,
       `<div class="result-data">${matrixToStr(lv.Jk)}</div>`);
 
     /* --- the two §II.F criteria and the scalarized one.  F_L is the mean retained
